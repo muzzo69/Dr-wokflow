@@ -10,12 +10,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Install AWS CLI
+      - name: Verify AWS CLI Installation
         run: |
-          if command -v aws &> /dev/null; then
-            echo "AWS CLI already installed, updating..."
-            sudo ./aws/install --update
-          else
+          if ! command -v aws &> /dev/null; then
+            echo "AWS CLI not found, installing..."
             curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
             unzip awscliv2.zip
             sudo ./aws/install
