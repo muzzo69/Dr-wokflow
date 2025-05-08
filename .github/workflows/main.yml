@@ -1,120 +1,92 @@
-name: Disaster Recovery Route 53 Failover
+name: AWS Disaster Recovery
+
+permissions:
+  id-token: write  # Required for OIDC authentication
+  contents: read
 
 on:
-  workflow_dispatch:  # Allows manual execution
+  push:
+    branches:
+      - feature/prod-dr
+  workflow_dispatch:
 
 jobs:
-  dr_failover:
+  check-primary-region:
+    name: Check Primary Region
     runs-on: ubuntu-latest
+    env:
+      AWS_REGION: us-east-1  # Primary region
+      HEALTH_CHECK_ID: 6fbd908a-e25a-401a-ae1a-b21cb509290c  # Added Health Check ID
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v2
 
-      - name: Verify & Install/Update AWS CLI
-        run: |
-          if command -v aws &> /dev/null; then
-            echo "AWS CLI is already installed."
-            aws --version
-          else
-            echo "Installing AWS CLI..."
-            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-            unzip -o awscliv2.zip
-            sudo ./aws/install
-          fi
-          aws --version
-
-      - name: Configure AWS Credentials
+      - name: Configure AWS credentials for Primary Region
         uses: aws-actions/configure-aws-credentials@v3
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1  # Change to your primary AWS region
+          role-to-assume: arn:aws:iam::576430970391:role/terraform-github-oidc-role
+          aws-region: us-east-1
 
-      - name: Check Primary Region Health via AWS CloudWatch
+      - name: Install jq
+        run: sudo apt-get install jq -y
+
+      - name: Check Primary Region Status
+        id: check-status
         run: |
-          HEALTH_STATUS=$(aws cloudwatch get-metric-data \
-            --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HTTPCode_Target_5XX_Count","Dimensions":[{"Name":"LoadBalancer","Value":"PRIMARY_LB_ARN"}]}},"Period":60,"Stat":"Sum"}]' \
-            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
-            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
-            --query 'MetricDataResults[0].Values[0]' --output text)
-          
-          if [[ "$HEALTH_STATUS" != "None" && "$HEALTH_STATUS" -gt 0 ]]; then
-            echo "Primary region is down. Triggering DR failover..."
-            echo "FAILOVER=true" >> $GITHUB_ENV
+          primary_status=$(aws route53 get-health-check-status \
+            --health-check-id $HEALTH_CHECK_ID \
+            --region us-east-1 | jq -r '.HealthCheckObservations[0].StatusReport.Status')
+          echo "Primary Region Status: $primary_status"
+          if [[ "$primary_status" == "UNHEALTHY" ]]; then
+            echo "status=DOWN" >> $GITHUB_ENV
+            echo "status=DOWN" >> $GITHUB_OUTPUT
           else
-            echo "Primary region is healthy."
-            echo "FAILOVER=false" >> $GITHUB_ENV
+            echo "status=UP" >> $GITHUB_ENV
+            echo "status=UP" >> $GITHUB_OUTPUT
           fi
 
-      - name: Verify Secondary Region Health
-        if: env.FAILOVER == 'true'
+    outputs:
+      status: ${{ steps.check-status.outputs.status }}
+
+  notify:
+    name: Send Notification
+    runs-on: ubuntu-latest
+    needs: check-primary-region
+    env:
+      AWS_REGION: us-east-1  # Primary region
+
+    steps:
+      - name: Configure AWS credentials for Notification
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          role-to-assume: arn:aws:iam::576430970391:role/terraform-github-oidc-role
+          aws-region: us-east-1
+
+      - name: Send AWS SNS Notification
         run: |
-          SECONDARY_HEALTH=$(aws cloudwatch get-metric-data \
-            --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HTTPCode_Target_5XX_Count","Dimensions":[{"Name":"LoadBalancer","Value":"SECONDARY_LB_ARN"}]}},"Period":60,"Stat":"Sum"}]' \
-            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
-            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
-            --query 'MetricDataResults[0].Values[0]' --output text)
-          
-          if [[ "$SECONDARY_HEALTH" != "None" && "$SECONDARY_HEALTH" -gt 0 ]]; then
-            echo "Secondary region is also down. No failover will be performed."
-            exit 1
+          if [[ "${{ needs.check-primary-region.outputs.status }}" == "DOWN" ]]; then
+            message="🚨 ALERT: Primary AWS region (us-east-1) is DOWN. Deploying to Secondary Region (us-west-2)."
+          else
+            message="✅ INFO: Primary AWS region (us-east-1) is HEALTHY. No failover required."
           fi
 
-      - name: Update Route 53 Record if Needed
-        if: env.FAILOVER == 'true'
-        run: |
-          cat <<EOF > route53-change.json
-          {
-            "Changes": [
-              {
-                "Action": "UPSERT",
-                "ResourceRecordSet": {
-                  "Name": "your-app.com",
-                  "Type": "A",
-                  "TTL": 60,
-                  "ResourceRecords": [
-                    { "Value": "SECONDARY_REGION_IP" }
-                  ]
-                }
-              }
-            ]
-          }
-          EOF
+          aws sns publish \
+            --topic-arn arn:aws:sns:us-east-1:576430970391:7c-Dr-topic \
+            --message "🚨 ALERT: Primary AWS region ($AWS_REGION) is DOWN. Deploying to Secondary Region (us-west-2)." \
+            --region $AWS_REGION
 
-          aws route53 change-resource-record-sets --hosted-zone-id YOUR_HOSTED_ZONE_ID --change-batch file://route53-change.json
+  deploy-secondary:
+    name: Deploy to Secondary Region
+    runs-on: ubuntu-latest
+    needs: [check-primary-region, notify]
+    env:
+      AWS_REGION: us-west-2  # Secondary region
+    if: ${{ needs.check-primary-region.outputs.status == 'DOWN' }}
 
-      - name: Notify on Failover
-        if: env.FAILOVER == 'true'
-        run: |
-          curl -X POST -H 'Content-type: application/json' --data '{"text":"Disaster Recovery: Traffic switched to secondary region!"}' ${{ secrets.SLACK_WEBHOOK_URL }}
-
-      - name: Rollback to Primary When Available
-        run: |
-          HEALTH_STATUS=$(aws cloudwatch get-metric-data \
-            --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"AWS/ApplicationELB","MetricName":"HTTPCode_Target_5XX_Count","Dimensions":[{"Name":"LoadBalancer","Value":"PRIMARY_LB_ARN"}]}},"Period":60,"Stat":"Sum"}]' \
-            --start-time $(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ) \
-            --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
-            --query 'MetricDataResults[0].Values[0]' --output text)
-          
-          if [[ "$HEALTH_STATUS" == "None" || "$HEALTH_STATUS" -eq 0 ]]; then
-            echo "Primary region has recovered. Restoring traffic."
-            cat <<EOF > route53-change.json
-            {
-              "Changes": [
-                {
-                  "Action": "UPSERT",
-                  "ResourceRecordSet": {
-                    "Name": "your-app.com",
-                    "Type": "A",
-                    "TTL": 60,
-                    "ResourceRecords": [
-                      { "Value": "PRIMARY_REGION_IP" }
-                    ]
-                  }
-                }
-              ]
-            }
-            EOF
-
-            aws route53 change-resource-record-sets --hosted-zone-id YOUR_HOSTED_ZONE_ID --change-batch file://route53-change.json
-          fi
+    steps:
+      - name: Call Terraform Apply Workflow
+        uses: ./.github/workflows/terraform-apply.yaml
+        with:
+          working-dir: servers
+          apply: true
